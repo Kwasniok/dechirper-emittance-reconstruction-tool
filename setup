@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+import argparse
+import numpy as np
+import pandas as pd
+from time import sleep
+from pathlib import Path
+from datetime import datetime
+from uuid import uuid4 as uuid
+import pydoocs
+
+parser = argparse.ArgumentParser(description="Measure emittance at EuXFEL T3")
+parser.add_argument(
+    "--lattice_config_index",
+    "-i",
+    type=int,
+    default=0,
+    help="Index of the lattice configuration to use for the measurement",
+)
+parser.add_argument(
+    "--experiment_name",
+    "-e",
+    type=str,
+    required=True,
+    help="Name of the experiment (used for data storage)",
+)
+parser.add_argument(
+    "--data_path",
+    "-d",
+    type=str,
+    default="data",
+    help="Path to store the measurement data",
+)
+parser.add_argument(
+    "--quads",
+    "-q",
+    type=str,
+    nargs="*",
+    default= None,
+    # [
+    #     "QE.2518.T3",
+    #     "QH.2529.T3",
+    #     "QH.2532.T3",
+    #     "QH.2544.T3",
+    # ],
+    help="Quads to be set by the script. All others are ignored.",
+)
+parser.add_argument(
+    "--cycle_quads",
+    "-c",
+    action="store_true",
+    help="Enable autocycling of the quads",
+)
+args = parser.parse_args()
+
+data_path = args.data_path
+
+
+def load_lattice_configs(experiment_name: str) -> pd.DataFrame:
+    path = Path(data_path, experiment_name, "lattice_configs.json")
+    return pd.read_json(path)
+
+
+def cycle_quads(quads: list[str] | None = None, valve_wait_time_sec: int = 60) -> None:
+    print("closing valve ...")
+    pydoocs.write("XFEL/VAC/OSD.SV2/T1#.00000.01/CMD_Close", 1)
+    print(f"waiting for {valve_wait_time_sec} seconds...")
+    sleep(valve_wait_time_sec)
+
+    print("cycling quads...")
+    for ch, value in target_doocs_params.items():
+            if quads is not None and not any(q in ch for q in quads):
+                print(f"WARNING: SKIPPING channel {ch}")
+                continue
+            pydoocs.write(ch.replace("KICK_MRAD.SP", "CYCLE"), 1)
+
+    
+    print("opening valve ...")
+    pydoocs.write("XFEL/VAC/OSD.SV2/T1#.00000.01/CMD_Open", 1)
+    sleep(valve_wait_time_sec)
+
+
+def setup(target_doocs_params: dict[str, float], quads:list[str] | None = None) -> None:
+
+    for ch, value in target_doocs_params.items():
+
+        if quads is not None and not any(q in ch for q in quads):
+            print(f"WARNING: SKIPPING channel {ch}")
+            continue
+
+        print(f"setting {ch} to {value}")
+        pydoocs.write(ch, value)
+
+    if args.cycle_quads:
+        cycle_quads(args.quads)
+
+
+# main
+lattice_configs = load_lattice_configs(args.experiment_name)
+target_lattice_config = lattice_configs.iloc[args.lattice_config_index]
+target_doocs_params = target_lattice_config["target_doocs_params"]
+setup(target_doocs_params, quads=args.quads)

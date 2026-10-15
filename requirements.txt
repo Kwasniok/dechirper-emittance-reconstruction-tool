@@ -1,0 +1,6 @@
+# numpy version compatible with ocelot:
+numpy==2.2.6
+matplotlib>=3.11,<4
+ocelot-collab>=26.6,<27
+opencv-python>=5.0,<6
+tqdm>=4.70,<5

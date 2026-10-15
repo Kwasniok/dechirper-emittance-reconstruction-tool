@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+
+import argparse
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from uuid import uuid4 as uuid
+from time import sleep
+import pydoocs
+
+parser = argparse.ArgumentParser(description="Measure emittance at EuXFEL T3")
+parser.add_argument(
+    "--lattice_config_index",
+    "-i",
+    type=int,
+    default=0,
+    help="Index of the lattice configuration to use for the measurement",
+)
+parser.add_argument(
+    "--experiment_name",
+    "-e",
+    type=str,
+    required=True,
+    help="Name of the experiment (used for data storage)",
+)
+parser.add_argument(
+    "--data_path",
+    "-d",
+    type=str,
+    default="data",
+    help="Path to store the measurement data",
+)
+args = parser.parse_args()
+
+
+def measure(experiment_name: str, lattice_config_index: int) -> dict[str, float]:
+    sample_id = (
+        "MES_"
+        + str(lattice_config_index)
+        + "_"
+        # time stamp incl milliseconds
+        + datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
+        + "-"
+        + uuid().hex[:8]
+    )
+
+    magnets = pydoocs.read("XFEL.MAGNETS/MAGNET.ML/*.T3/KICK_MRAD.SP")
+    bpms = pydoocs.read("XFEL.DIAG/BPM/*.T3/X.ALL")
+    orbits_x = pydoocs.read("XFEL.DIAG/ORBIT/*.T3/X.ALL.HOLD")
+    orbits_y = pydoocs.read("XFEL.DIAG/ORBIT/*.T3/Y.ALL.HOLD")
+    screens = pydoocs.read("XFEL.DIAG/CAMERA/OTRC.2560.T3/IMAGE_EXT_ZMQ")
+
+    path_raw = Path(args.data_path, experiment_name, "samples_raw", f"{sample_id}.npz")
+    path_raw.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "magnets": magnets,
+        "bpms": bpms,
+        "orbits_x": orbits_x,
+        "orbits_y": orbits_y,
+        "screens": screens,
+    }
+
+    np.savez(path_raw, **data)
+
+    return data
+
+
+# main
+num_measurements = 40
+for i in range(num_measurements):
+    print(f"Measurement {i+1}/{num_measurements}")
+    data = measure(args.experiment_name, args.lattice_config_index)
+    sleep(0.333)
