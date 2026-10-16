@@ -29,7 +29,7 @@ from ocelot_util import (
 )
 import t3
 
-from table_aux import print_matrix
+from table_aux import pretty_print_matrix
 
 # %%
 DECHIRPER_START = "VCCHIRP_S.2487.T3"
@@ -560,7 +560,7 @@ def make_lattice_and_navigator(
 
 
 if __name__ == "__main__":
-    from beam import BeamParameters, make_beam
+    from beam import BeamParameters, make_beam_with_random_gaussian_mixture_current_profile
 
     lattice, navigator = make_lattice_and_navigator(
         LatticeHighLevelParams(
@@ -583,7 +583,7 @@ if __name__ == "__main__":
         beta_y=twiss0.beta_y,
     )
 
-    parts0 = make_beam(bea_params0, num_particles=20_000)
+    parts0 = make_beam_with_random_gaussian_mixture_current_profile(bea_params0, num_particles=20_000)
 
     twisses, partss = track(lattice, parts0, navigator)
 
@@ -600,9 +600,9 @@ def show_lattice(lattice: MagneticLattice):
     lat_vec, lat_matrix = lattice.transfer_maps(energy=twiss0.E)[:2]
 
     print("R matrix:")
-    print_matrix(lat_matrix)
+    pretty_print_matrix(lat_matrix)
     print("B vector:")
-    print_matrix(lat_vec)
+    pretty_print_matrix(lat_vec)
     print(f"Dx: {lat_matrix[0, 5]}")
 
     print(
