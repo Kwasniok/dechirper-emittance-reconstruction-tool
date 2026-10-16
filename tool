@@ -108,7 +108,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from beam import BeamParameters, make_beam
+from beam import BeamParameters, make_beam_with_random_gaussian_mixture_current_profile
 from lattice import (
     LatticeLowLevelParams,
     make_lattice,
@@ -2312,7 +2312,7 @@ def simulate_experiment(
             sigma_p=settings.sigma_p,
             chirp=settings.chirp,
         )
-        particles = make_beam(beam, num_particles=settings.num_particles)
+        particles = make_beam_with_random_gaussian_mixture_current_profile(beam, num_particles=settings.num_particles)
         return particles
 
     def make_screen_image(final: Any, half_x: float, half_y: float) -> Array:
