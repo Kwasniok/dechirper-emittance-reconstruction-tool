@@ -7,3 +7,4 @@ structure long function bodies into named local functions
 add unit tests for larger functions and modules
 run black to format code
 ensure requirements.txt is up to date when code is changed and implements version constraints (e.g. >= 1.2,<=2 larger than major.minor and less than next major, when in doubt read pip freeze to determine current major.minor version)
+keep protocols.md updated when file formats change, detect and fix inconsistencies

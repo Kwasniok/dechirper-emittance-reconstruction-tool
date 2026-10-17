@@ -5,6 +5,9 @@ Disclaimer: This code is created with AI support.
 
 Requires Python 3.13 or newer.
 
+The Lattice Preview tab compares configuration phase advances on the initial
+Twiss ellipses, using design optics at the configured lattice entrance by default.
+
 Usage:
     python tool gui data/EXPERIMENT
     python tool analyze data/EXPERIMENT --output export_parent
@@ -89,6 +92,7 @@ from uuid import uuid4
 import cv2
 from matplotlib import colormaps
 from matplotlib.axes import Axes
+from matplotlib.backend_bases import MouseEvent
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.container import ErrorbarContainer
 from matplotlib.figure import Figure
@@ -96,7 +100,7 @@ from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea
 from matplotlib.patches import Rectangle
 import numpy as np
 from numpy.typing import NDArray
-from ocelot import MagneticLattice, SecondTM, track, twiss
+from ocelot import MagneticLattice, SecondTM, Twiss, track, twiss
 from ocelot.cpbd.matcher import MatchProblem, Target, TargetReport
 from scipy import ndimage
 from scipy.optimize import curve_fit
@@ -114,6 +118,7 @@ from lattice import (
     make_lattice,
     make_lattice_and_navigator,
     make_twiss0,
+    show_lattice,
 )
 from ocelot_util import (
     get_lattice_element,
@@ -363,6 +368,7 @@ class SampleStatus(StrEnum):
 class WorkerOperation(StrEnum):
     REFRESH = "refresh"
     PROCESSING_PREVIEW = "processing_preview"
+    LATTICE_PREVIEW = "lattice_preview"
     EXPORT = "export"
     PREPARATION = "preparation"
 
@@ -2299,7 +2305,7 @@ def simulate_experiment(
                 * (1 + rng.uniform(-1, 1) * settings.twiss_noise),
             )
         emit = settings.normalized_emittance * REST_ENERGY_GEV / energy
-        beam = BeamParameters(
+        beam_params = BeamParameters(
             energy=energy,
             charge=settings.charge,
             emit_x=emit,
@@ -2312,7 +2318,9 @@ def simulate_experiment(
             sigma_p=settings.sigma_p,
             chirp=settings.chirp,
         )
-        particles = make_beam_with_random_gaussian_mixture_current_profile(beam, num_particles=settings.num_particles)
+        particles = make_beam_with_random_gaussian_mixture_current_profile(
+            beam_params, num_particles=settings.num_particles
+        )
         return particles
 
     def make_screen_image(final: Any, half_x: float, half_y: float) -> Array:
@@ -2978,6 +2986,371 @@ def plot_snapshot(
 
 
 @dataclass(frozen=True)
+class LatticePreview:
+    """Target lattices and optics propagated from one shared entrance state."""
+
+    initial: Twiss
+    lattices: list[MagneticLattice]
+    profiles: list[list[Twiss]]
+    phases: Array  # configuration, plane; radians modulo 2 pi
+
+
+def lattice_design_values(initial: Twiss) -> dict[str, float]:
+    """Resolve entrance design values; use the simulation emittance if unspecified."""
+    values: dict[str, float] = {}
+    for plane in Plane:
+        normalized = (
+            float(getattr(initial, f"emit_{plane}")) * initial.E / REST_ENERGY_GEV
+        )
+        values[f"emit_{plane}"] = (
+            normalized if normalized > 0 else SimulationSettings.normalized_emittance
+        ) * 1e6  # GUI units: mm mrad
+        for name in ("beta", "alpha"):
+            values[f"{name}_{plane}"] = float(getattr(initial, f"{name}_{plane}"))
+    return values
+
+
+def lattice_preview_initial(
+    design: Twiss, energy: float, controls: Mapping[str, str]
+) -> Twiss:
+    """Apply editable design/numeric selectors without changing the design reference."""
+    initial = copy.deepcopy(design)
+    initial.E = energy
+    defaults = lattice_design_values(design)
+    for name, default in defaults.items():
+        text = controls.get(name, "Design").strip()
+        value = default if text == "Design" else float(text)
+        if not math.isfinite(value) or (not name.startswith("alpha") and value <= 0):
+            raise ValueError(
+                f"{name} must be finite"
+                + (" and positive" if not name.startswith("alpha") else "")
+            )
+        if name.startswith("emit"):
+            value *= 1e-6 * REST_ENERGY_GEV / energy
+        setattr(initial, name, value)
+    return initial
+
+
+def make_lattice_preview(document: dict[str, Any], initial: Twiss) -> LatticePreview:
+    """Propagate all target configurations and derive phase advance from their maps.
+
+    The atan2 convention follows 04_make_lattice.ipynb and remains valid for
+    user-supplied, unmatched Twiss values. Phases are measured from the actual
+    entrance, independently of the design state's accumulated phase.
+    """
+    lattices: list[MagneticLattice] = []
+    profiles: list[list[Twiss]] = []
+    phases = np.empty((len(document["low_level_params"]), 2))
+    for index, target in enumerate(document["low_level_params"]):
+        lattice = make_lattice(LatticeLowLevelParams(**target))
+        profile = twiss(lattice, copy.deepcopy(initial))
+        matrix = lattice.transfer_maps(energy=initial.E)[1]
+        for column, plane in enumerate(Plane):
+            offset = plane.matrix_index
+            beta0 = getattr(initial, f"beta_{plane}")
+            beta1 = getattr(profile[-1], f"beta_{plane}")
+            alpha0 = getattr(initial, f"alpha_{plane}")
+            sine = matrix[offset, offset + 1] / np.sqrt(beta0 * beta1)
+            cosine = matrix[offset, offset] * np.sqrt(beta0 / beta1) - alpha0 * sine
+            phases[index, column] = np.arctan2(sine, cosine) % (2 * np.pi)
+        lattices.append(lattice)
+        profiles.append(profile)
+    if not np.isfinite(phases).all():
+        raise ValueError("Nonfinite phase advance in lattice optics")
+    return LatticePreview(copy.deepcopy(initial), lattices, profiles, phases)
+
+
+def plot_lattice_phases(
+    axis: Axes,
+    preview: LatticePreview,
+    plane: Plane,
+    selected: int,
+    normalized: bool,
+) -> int:
+    """Compare every configuration on its one-sigma entrance ellipse."""
+    beta = getattr(preview.initial, f"beta_{plane}")
+    alpha = getattr(preview.initial, f"alpha_{plane}")
+    emittance = getattr(preview.initial, f"emit_{plane}")
+
+    def coordinates(phase: Array) -> tuple[Array, Array]:
+        """Use physical mm/mrad or dimensionless Courant–Snyder coordinates."""
+        if normalized:
+            return np.cos(phase), np.sin(phase)
+        return (
+            1e3 * np.sqrt(emittance * beta) * np.cos(phase),
+            1e3 * np.sqrt(emittance / beta) * (-alpha * np.cos(phase) + np.sin(phase)),
+        )
+
+    theta = np.linspace(0, 2 * np.pi, 361)
+    axis.plot(*coordinates(theta), color="0.4", label="Initial Twiss ellipse")
+    axis.scatter(
+        *coordinates(np.array([0.0])),
+        marker="x",
+        color="black",
+        s=65,
+        label="Δμ = 0",
+        zorder=4,
+    )
+    column = 0 if plane == Plane.X else 1
+    phases = preview.phases[:, column]
+    positions = coordinates(phases)
+    colors = colormaps["viridis"](np.linspace(0, 1, len(phases)))
+    points = axis.scatter(*positions, c=colors, s=45, zorder=3)
+    current = (positions[0][selected], positions[1][selected])
+    axis.annotate(
+        str(selected), current, xytext=(7, 7), textcoords="offset points", fontsize=9
+    )
+    axis.scatter(
+        *current,
+        color="tab:red",
+        marker="*",
+        s=210,
+        edgecolors="black",
+        zorder=5,
+        label=f"ID {selected}: Δμ = {phases[selected]:.3f} rad ({np.degrees(phases[selected]):.1f}°)",
+    )
+    axis.plot(
+        [0, current[0]], [0, current[1]], color="tab:red", alpha=0.5, linestyle="--"
+    )
+    axis.set_title(rf"$\Delta\mu_{plane}$ at lattice start")
+    axis.set_xlabel(rf"$u_{plane}$" if normalized else rf"${plane}$ [mm]")
+    axis.set_ylabel(rf"$u'_{plane}$" if normalized else rf"${plane}'$ [mrad]")
+    if normalized:
+        axis.set_aspect("equal", adjustable="box")
+    axis.margins(0.15)
+    axis.axhline(0, color="gray", alpha=0.2)
+    axis.axvline(0, color="gray", alpha=0.2)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), fontsize=8)
+    tooltip = axis.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(10, 10),
+        textcoords="offset points",
+        bbox={"boxstyle": "round", "fc": "white", "alpha": 0.95},
+        fontsize=8,
+        zorder=10,
+    )
+    tooltip.set_visible(False)
+
+    def hover(event: MouseEvent) -> None:
+        """Identify all overlapping configurations without crowding the ellipse."""
+        hit, info = points.contains(event) if event.inaxes is axis else (False, {})
+        was_visible = tooltip.get_visible()
+        if hit:
+            indices = info["ind"]
+            index = int(indices[0])
+            tooltip.xy = (positions[0][index], positions[1][index])
+            tooltip.set_text(
+                "\n".join(
+                    f"ID {i}: {phases[i]:.4f} rad ({np.degrees(phases[i]):.2f}°)"
+                    for i in indices
+                )
+            )
+        tooltip.set_visible(hit)
+        if hit or was_visible:
+            axis.figure.canvas.draw_idle()
+
+    return axis.figure.canvas.mpl_connect("motion_notify_event", hover)
+
+
+class LatticePreviewPanel:
+    """Own the lattice controls and plots; queue optics work on the desktop worker."""
+
+    def __init__(self, parent: ttk.Frame, experiment: Path) -> None:
+        self.experiment = experiment
+        self.document: dict[str, Any] | None = None
+        self.design: Twiss | None = None
+        self.preview: LatticePreview | None = None
+        self.revision = 0
+        self.pending: tuple[int, dict[str, Any], Twiss] | None = None
+        self.timer: str | None = None
+        self.hover_callbacks: set[int] = set()
+        self.parent = parent
+        self.config_id = tk.StringVar(parent, value="0")
+        self.coordinates = tk.StringVar(parent, value="Original")
+        self.status = tk.StringVar(parent, value="Waiting for lattice configurations")
+        self.variables: dict[str, tk.StringVar] = {}
+        self.boxes: dict[str, ttk.Combobox] = {}
+        self.design_labels: dict[str, ttk.Label] = {}
+        self._build()
+
+    def _build(self) -> None:
+        """Place the six editable design selectors beside a three-panel plot grid."""
+        sidebar = ttk.Frame(self.parent, padding=10, width=270)
+        sidebar.pack(side="left", fill="y")
+        plots = ttk.Frame(self.parent)
+        plots.pack(side="right", fill="both", expand=True)
+        ttk.Label(sidebar, text="Lattice configuration ID").pack(anchor="w")
+        self.config_box = ttk.Combobox(
+            sidebar, textvariable=self.config_id, state="readonly", width=24
+        )
+        self.config_box.pack(fill="x", pady=(3, 12))
+        ttk.Label(sidebar, text="Initial Twiss at lattice start").pack(anchor="w")
+        for plane in Plane:
+            group = ttk.LabelFrame(sidebar, text=f"{plane.upper()} plane", padding=6)
+            group.pack(fill="x", pady=6)
+            for name, label in (
+                ("emit", "Normalized ε [mm mrad]"),
+                ("beta", "β [m]"),
+                ("alpha", "α"),
+            ):
+                key = f"{name}_{plane}"
+                variable = tk.StringVar(self.parent, value="Design")
+                ttk.Label(group, text=label).pack(anchor="w")
+                box = ttk.Combobox(
+                    group, textvariable=variable, values=("Design",), width=24
+                )
+                box.pack(fill="x")
+                design_label = ttk.Label(group, text="Design: —")
+                design_label.pack(anchor="w", pady=(0, 4))
+                self.variables[key], self.boxes[key], self.design_labels[key] = (
+                    variable,
+                    box,
+                    design_label,
+                )
+                variable.trace_add("write", self.schedule)
+        ttk.Label(sidebar, text="Phase space coordinates").pack(
+            anchor="w", pady=(10, 0)
+        )
+        ttk.Combobox(
+            sidebar,
+            textvariable=self.coordinates,
+            values=("Original", "Normalized"),
+            state="readonly",
+            width=24,
+        ).pack(fill="x", pady=3)
+        ttk.Label(
+            sidebar,
+            text="Choose Design or type a value.\nNormalized coordinates use a unit circle.\nWhen design emittance is unspecified,\nεₙ = 1 mm mrad is used.",
+            wraplength=260,
+            justify="left",
+        ).pack(anchor="w", pady=10)
+        ttk.Label(plots, textvariable=self.status, wraplength=1050, padding=6).pack(
+            fill="x"
+        )
+        self.figure = Figure(figsize=(11, 8))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plots)
+        toolbar = NavigationToolbar2Tk(self.canvas, plots, pack_toolbar=False)
+        toolbar.pack(side="bottom", fill="x")
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.config_id.trace_add("write", lambda *args: self.draw())
+        self.coordinates.trace_add("write", lambda *args: self.draw())
+
+    def refresh_document(self) -> None:
+        """Reload independently of sample availability, retaining valid draft controls."""
+        try:
+            content, _ = stable_bytes(self.experiment / "lattice_configs.json")
+            document = configuration_document(content)
+            if document == self.document:
+                return
+            self.design = make_twiss0(document["low_level_params"][0]["start"])
+            self.document = document
+            defaults = lattice_design_values(self.design)
+            for name, value in defaults.items():
+                self.boxes[name].configure(values=("Design", f"{value:.8g}"))
+                self.design_labels[name].configure(text=f"Design: {value:.6g}")
+            ids = tuple(
+                str(index) for index in range(len(document["low_level_params"]))
+            )
+            self.config_box.configure(values=ids)
+            if self.config_id.get() not in ids:
+                self.config_id.set(ids[0])
+            self.schedule()
+        except Exception as error:
+            self.document = None
+            self.invalidate(f"Lattice preview: {error}")
+
+    def invalidate(self, message: str) -> None:
+        """Discard obsolete work and plots while input is changing or invalid."""
+        self.revision += 1
+        self.pending = None
+        self.preview = None
+        self.status.set(message)
+        self.clear()
+        self.canvas.draw_idle()
+
+    def clear(self) -> None:
+        """Disconnect Ocelot hover handlers before replacing their axes."""
+        for callback in self.hover_callbacks:
+            self.canvas.mpl_disconnect(callback)
+        self.hover_callbacks.clear()
+        self.figure.clear()
+
+    def schedule(self, *args: str) -> None:
+        """Debounce numerical edits and invalidate results from earlier controls."""
+        self.invalidate("Updating lattice preview…")
+        if self.timer is not None:
+            self.parent.after_cancel(self.timer)
+        self.timer = self.parent.after(350, self.queue)
+
+    def queue(self) -> None:
+        """Validate draft values before submitting propagation to the worker."""
+        self.timer = None
+        if self.document is None or self.design is None:
+            return
+        try:
+            initial = lattice_preview_initial(
+                self.design,
+                float(self.document["high_level_params"][0]["beam_energy"]),
+                {name: variable.get() for name, variable in self.variables.items()},
+            )
+            self.pending = (self.revision, self.document, initial)
+        except Exception as error:
+            self.invalidate(f"Lattice preview: {error}")
+
+    def display(self, revision: int | None, preview: LatticePreview) -> None:
+        """Accept only a result for the current configuration document and controls."""
+        if revision == self.revision:
+            self.preview = preview
+            self.draw()
+
+    def draw(self) -> None:
+        """Use the selected lattice above the two phase-space comparison panels."""
+        if self.preview is None:
+            return
+        self.clear()
+        selected = int(self.config_id.get())
+        upper, lower = self.figure.subfigures(2, 1, height_ratios=(1.1, 1))
+        lattice = self.preview.lattices[selected]
+        upper.suptitle(
+            f"Configuration {selected}: {lattice.sequence[0].id} → {lattice.sequence[-1].id}",
+            fontsize=10,
+        )
+        before = set(self.canvas.callbacks.callbacks.get("motion_notify_event", {}))
+        show_lattice(
+            lattice,
+            self.preview.initial,
+            figure=upper,
+            twisses=self.preview.profiles[selected],
+            show=False,
+            diagnostics=False,
+        )
+        self.hover_callbacks = (
+            set(self.canvas.callbacks.callbacks.get("motion_notify_event", {})) - before
+        )
+        axes = lower.subplots(1, 2)
+        lower.subplots_adjust(left=0.09, right=0.97, bottom=0.30, top=0.90, wspace=0.32)
+        for axis, plane in zip(axes, Plane):
+            callback = plot_lattice_phases(
+                axis,
+                self.preview,
+                plane,
+                selected,
+                self.coordinates.get() == "Normalized",
+            )
+            self.hover_callbacks.add(callback)
+        self.status.set(
+            f"Target lattice configurations | {len(self.preview.lattices)} IDs | E = {self.preview.initial.E:g} GeV | Red star: selected ID. Hover points for all IDs and phase advances."
+        )
+        self.canvas.draw_idle()
+
+    def close(self) -> None:
+        """Cancel edits queued for widgets about to be destroyed."""
+        if self.timer is not None:
+            self.parent.after_cancel(self.timer)
+
+
+@dataclass(frozen=True)
 class PreviewRequest:
     """A sample and draft configuration captured when a preview is queued."""
 
@@ -3038,6 +3411,7 @@ class DesktopView:
     processing_status: tk.StringVar
     preparation: tk.Text
     output_path: tk.StringVar
+    lattice_preview: LatticePreviewPanel | None = None
 
 
 class DesktopController:
@@ -3446,6 +3820,11 @@ class DesktopController:
     def show_worker_error(self, job: WorkerJob, error: Exception) -> None:
         """Clear current failed reconstructions and keep obsolete jobs from clearing newer results."""
         match job.operation:
+            case WorkerOperation.LATTICE_PREVIEW:
+                panel = self.view.lattice_preview
+                if panel is not None and job.preview_revision == panel.revision:
+                    panel.invalidate(f"Lattice preview: {error}")
+                return
             case WorkerOperation.PROCESSING_PREVIEW:
                 if job.preview_revision == self.state.processing_preview_revision:
                     self.view.processing_status.set(f"Preview: {error}")
@@ -3473,6 +3852,9 @@ class DesktopController:
                     )
                 case WorkerOperation.PROCESSING_PREVIEW:
                     self.display_processing_preview(job.preview_revision, result)
+                case WorkerOperation.LATTICE_PREVIEW:
+                    if self.view.lattice_preview is not None:
+                        self.view.lattice_preview.display(job.preview_revision, result)
                 case WorkerOperation.REFRESH if job.analysis is self.state.analysis:
                     self.display_snapshot(result)
                     self.redraw()
@@ -3498,11 +3880,27 @@ class DesktopController:
                 preview_revision=request.revision,
             )
             self.view.processing_status.set("Processing preview of current controls…")
+        elif (
+            self.view.lattice_preview is not None
+            and self.view.lattice_preview.pending is not None
+        ):
+            panel = self.view.lattice_preview
+            revision, document, initial = panel.pending
+            panel.pending = None
+            self.submit(
+                WorkerOperation.LATTICE_PREVIEW,
+                make_lattice_preview,
+                document,
+                initial,
+                preview_revision=revision,
+            )
         elif self.state.pending_refresh or (
             self.view.watching.get()
             and now - self.state.last_refresh
             >= self.state.analysis.settings.poll_seconds
         ):
+            if self.view.lattice_preview is not None:
+                self.view.lattice_preview.refresh_document()
             self.submit(WorkerOperation.REFRESH, self.state.analysis.refresh)
             self.state.pending_refresh = False
             self.state.last_refresh = now
@@ -3530,6 +3928,8 @@ class DesktopController:
         if self.state.closing:
             return
         self.state.closing = True
+        if self.view.lattice_preview is not None:
+            self.view.lattice_preview.close()
         for timer in (
             self.state.processing_preview_timer,
             self.state.slice_update_timer,
@@ -3584,21 +3984,34 @@ def desktop(experiment: Path, settings_path: Path | None) -> None:
         ).grid(row=0, column=5)
 
     def build_tabs() -> tuple[ttk.Frame, ...]:
-        """Create the processing, reconstruction, data, diagnostics, and preparation pages."""
+        """Create the processing, optics, reconstruction, and preparation pages."""
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True)
-        reconstruction_tab, samples_tab, fits_tab, settings_tab, preparation_tab = (
-            ttk.Frame(notebook) for _ in range(5)
-        )
+        (
+            reconstruction_tab,
+            samples_tab,
+            fits_tab,
+            settings_tab,
+            preparation_tab,
+            lattice_tab,
+        ) = (ttk.Frame(notebook) for _ in range(6))
         for tab, title in [
             (settings_tab, "Image Processing"),
+            (lattice_tab, "Lattice Preview"),
             (reconstruction_tab, "Reconstruction"),
             (samples_tab, "Samples"),
             (fits_tab, "Fit Diagnostics"),
             (preparation_tab, "Simulation"),
         ]:
             notebook.add(tab, text=title)
-        return reconstruction_tab, samples_tab, fits_tab, settings_tab, preparation_tab
+        return (
+            reconstruction_tab,
+            samples_tab,
+            fits_tab,
+            settings_tab,
+            preparation_tab,
+            lattice_tab,
+        )
 
     def build_reconstruction_tab() -> tuple[Figure, FigureCanvasTkAgg, ttk.Combobox]:
         """Place reconstruction controls above the shared plots and export toolbar."""
@@ -3889,9 +4302,14 @@ def desktop(experiment: Path, settings_path: Path | None) -> None:
 
     build_controls()
 
-    reconstruction_tab, samples_tab, fits_tab, settings_tab, preparation_tab = (
-        build_tabs()
-    )
+    (
+        reconstruction_tab,
+        samples_tab,
+        fits_tab,
+        settings_tab,
+        preparation_tab,
+        lattice_tab,
+    ) = build_tabs()
 
     figure, canvas, slice_count_box = build_reconstruction_tab()
 
@@ -3908,6 +4326,7 @@ def desktop(experiment: Path, settings_path: Path | None) -> None:
     ) = build_processing_tab()
 
     preparation, prep_controls, output_path = build_preparation_tab()
+    lattice_preview = LatticePreviewPanel(lattice_tab, experiment)
     ttk.Label(root, textvariable=status, padding=6, wraplength=1400).pack(fill="x")
     view = DesktopView(
         root=root,
@@ -3930,6 +4349,7 @@ def desktop(experiment: Path, settings_path: Path | None) -> None:
         processing_status=processing_status,
         preparation=preparation,
         output_path=output_path,
+        lattice_preview=lattice_preview,
     )
     controller = DesktopController(AppState(analysis=analysis), view)
 
@@ -4106,6 +4526,7 @@ def self_test() -> None:
             )
             view = replace(
                 view,
+                lattice_preview=None,
                 form_variables={
                     name: Mock(wraps=Value(value))
                     for name, value in self.settings.to_form_values().items()
@@ -4116,6 +4537,246 @@ def self_test() -> None:
             controller = DesktopController(AppState(self.live), view, ManualExecutor())
             self.addCleanup(controller.close)
             return controller
+
+        def test_lattice_preview_initial_design_and_overrides(self) -> None:
+            """Resolve design at different entrances and preserve normalized emittance at scan energy."""
+            for start in (t3.cell[0].id, "VCCHIRP_S.2487.T3"):
+                design = make_twiss0(start)
+                before = copy.deepcopy(design.__dict__)
+                initial = lattice_preview_initial(design, 14.0, {})
+                self.assertEqual(initial.beta_x, design.beta_x)
+                self.assertEqual(initial.alpha_y, design.alpha_y)
+                self.assertAlmostEqual(initial.emit_x * 14 / REST_ENERGY_GEV, 1e-6)
+                custom = lattice_preview_initial(
+                    design,
+                    14.0,
+                    {
+                        "emit_x": "2.5",
+                        "beta_x": "7.5",
+                        "alpha_x": "-1.2",
+                        "emit_y": "0.5",
+                        "beta_y": "13",
+                        "alpha_y": "2.1",
+                    },
+                )
+                self.assertEqual((custom.beta_x, custom.alpha_x), (7.5, -1.2))
+                self.assertEqual((custom.beta_y, custom.alpha_y), (13, 2.1))
+                self.assertAlmostEqual(custom.emit_x * 14 / REST_ENERGY_GEV, 2.5e-6)
+                self.assertAlmostEqual(custom.emit_y * 14 / REST_ENERGY_GEV, 0.5e-6)
+                self.assertEqual(design.__dict__, before)
+                for name in lattice_design_values(design):
+                    for invalid in (
+                        ("nan", "inf", "bad")
+                        if name.startswith("alpha")
+                        else ("nan", "inf", "0", "-1", "bad")
+                    ):
+                        with (
+                            self.subTest(name=name, invalid=invalid),
+                            self.assertRaises(ValueError),
+                        ):
+                            lattice_preview_initial(design, 14.0, {name: invalid})
+            design.emit_x = 3e-11
+            expected = design.emit_x * design.E / REST_ENERGY_GEV
+            self.assertAlmostEqual(
+                lattice_design_values(design)["emit_x"] * 1e-6, expected
+            )
+
+        def test_lattice_preview_phase_and_ellipse_coordinates(self) -> None:
+            """Check phases against analytic drift optics and ellipse points against covariance."""
+            from ocelot import Drift
+            from matplotlib.backend_bases import MouseEvent
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+            initial = lattice_preview_initial(
+                make_twiss0(),
+                14.0,
+                {
+                    "emit_x": "2",
+                    "beta_x": "3",
+                    "alpha_x": "-0.7",
+                    "emit_y": "0.5",
+                    "beta_y": "11",
+                    "alpha_y": "0.4",
+                },
+            )
+            initial.mux, initial.muy = 8.5, 17.0
+            lattices = [
+                MagneticLattice((Drift(l=length, eid="D"),)) for length in (1.0, 5.0)
+            ]
+            document = {"low_level_params": [{}, {}]}
+            with patch.object(
+                sys.modules[__name__], "make_lattice", side_effect=lattices
+            ):
+                preview = make_lattice_preview(document, initial)
+            for column, plane in enumerate(Plane):
+                beta = getattr(initial, f"beta_{plane}")
+                alpha = getattr(initial, f"alpha_{plane}")
+                emit = getattr(initial, f"emit_{plane}")
+                expected = np.arctan2(
+                    np.array([1.0, 5.0]), beta - alpha * np.array([1.0, 5.0])
+                ) % (2 * np.pi)
+                np.testing.assert_allclose(preview.phases[:, column], expected)
+                covariance = emit * np.array(
+                    [[beta, -alpha], [-alpha, (1 + alpha**2) / beta]]
+                )
+                for normalized in (False, True):
+                    figure = Figure(figsize=(6, 5))
+                    canvas = FigureCanvasAgg(figure)
+                    axis = figure.add_subplot()
+                    plot_lattice_phases(axis, preview, plane, 1, normalized)
+                    points = np.asarray(axis.lines[0].get_data())
+                    if normalized:
+                        np.testing.assert_allclose(
+                            np.sum(points**2, axis=0), 1.0, atol=1e-12
+                        )
+                    else:
+                        points *= 1e-3
+                        np.testing.assert_allclose(
+                            np.einsum(
+                                "in,ij,jn->n", points, np.linalg.inv(covariance), points
+                            ),
+                            1.0,
+                            atol=1e-12,
+                        )
+                    selected = np.asarray(axis.collections[2].get_offsets())[0]
+                    all_points = np.asarray(axis.collections[1].get_offsets())
+                    np.testing.assert_allclose(selected, all_points[1])
+                    canvas.draw()
+                    x, y = axis.transData.transform(all_points[0])
+                    event = MouseEvent("motion_notify_event", canvas, x, y)
+                    canvas.callbacks.process("motion_notify_event", event)
+                    self.assertTrue(axis.texts[-1].get_visible())
+                    self.assertIn("ID 0:", axis.texts[-1].get_text())
+
+        def test_show_lattice_embedded_without_pyplot_windows(self) -> None:
+            """Render the lattice on a SubFigure using a custom seed and no standalone window."""
+            from ocelot import Drift, Quadrupole
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.backend_bases import MouseEvent
+            import matplotlib.pyplot as plt
+
+            initial = lattice_preview_initial(make_twiss0(), 14, {"beta_x": "7"})
+            lattice = MagneticLattice(
+                (Quadrupole(l=0.3, k1=0.2, eid="Q"), Drift(l=2, eid="D"))
+            )
+            figure = Figure(figsize=(8, 6))
+            canvas = FigureCanvasAgg(figure)
+            embedded = figure.subfigures(1, 1)
+            before = plt.get_fignums()
+            with patch.object(plt, "show") as show:
+                show_lattice(
+                    lattice, initial, figure=embedded, show=False, diagnostics=False
+                )
+                canvas.draw()
+                self.assertEqual(embedded.axes[1].lines[0].get_ydata()[0], 7)
+                axis = embedded.axes[2]
+                x, y = axis.transData.transform((initial.s + 0.15, 0.2))
+                event = MouseEvent("motion_notify_event", canvas, x, y)
+                canvas.callbacks.process("motion_notify_event", event)
+                self.assertTrue(any(text.get_visible() for text in axis.texts))
+                show.assert_not_called()
+            self.assertEqual(plt.get_fignums(), before)
+
+        def test_controller_lattice_preview_ownership(self) -> None:
+            """Queue propagation ahead of scans and discard an outdated result or error."""
+            controller = self.make_controller()
+            panel = Mock(spec=LatticePreviewPanel)
+            panel.revision = 3
+            panel.pending = (3, self.document, Twiss())
+            controller.view = replace(controller.view, lattice_preview=panel)
+            controller.start_pending_operation()
+            job = controller.state.job
+            assert job is not None
+            self.assertEqual(job.operation, WorkerOperation.LATTICE_PREVIEW)
+            self.assertIsNone(panel.pending)
+            result = Mock(spec=LatticePreview)
+            job.future.set_result(result)
+            controller.consume_finished_operation()
+            panel.display.assert_called_once_with(3, result)
+            # The panel owns revision checks; stale results must not redraw it.
+            actual_panel = LatticePreviewPanel.__new__(LatticePreviewPanel)
+            actual_panel.revision = 4
+            actual_panel.preview = None
+            actual_panel.draw = Mock()
+            actual_panel.display(3, result)
+            self.assertIsNone(actual_panel.preview)
+            actual_panel.draw.assert_not_called()
+            actual_panel.display(4, result)
+            actual_panel.draw.assert_called_once()
+            panel.revision = 4
+            controller.show_worker_error(job, ValueError("old error"))
+            panel.invalidate.assert_not_called()
+            panel.revision = 3
+            controller.show_worker_error(job, ValueError("current error"))
+            panel.invalidate.assert_called_once()
+
+        def test_lattice_panel_reload_and_redraw(self) -> None:
+            """Reload an entrance without samples and keep redraw callbacks bounded."""
+            from ocelot import Drift
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+            panel = LatticePreviewPanel.__new__(LatticePreviewPanel)
+            panel.experiment = self.path
+            panel.parent = Mock()
+            panel.parent.after.return_value = "timer"
+            panel.document, panel.design, panel.preview = None, None, None
+            panel.pending, panel.timer = None, None
+            panel.revision = 0
+            panel.hover_callbacks = set()
+            panel.config_id, panel.coordinates = Value("9"), Value("Original")
+            panel.status, panel.config_box = Value(""), Mock()
+            initial = lattice_preview_initial(make_twiss0(), 14, {})
+            defaults = lattice_design_values(initial)
+            panel.variables = {name: Value("Design") for name in defaults}
+            panel.boxes = {name: Mock() for name in defaults}
+            panel.design_labels = {name: Mock() for name in defaults}
+            panel.figure = Figure(figsize=(11, 8))
+            panel.canvas = FigureCanvasAgg(panel.figure)
+            with patch.object(
+                sys.modules[__name__], "make_twiss0", return_value=initial
+            ) as design:
+                panel.refresh_document()
+                design.assert_called_once_with("START")
+                self.assertEqual(panel.config_id.get(), "0")
+                panel.queue()
+                assert panel.pending is not None
+                self.assertEqual(panel.pending[2].beta_x, initial.beta_x)
+                revision = panel.revision
+                panel.refresh_document()
+                self.assertEqual(panel.revision, revision)
+                changed = copy.deepcopy(self.document)
+                for params in (
+                    changed["low_level_params"],
+                    changed["high_level_params"],
+                ):
+                    params[0]["start"] = "ANOTHER_START"
+                atomic_json(self.path / "lattice_configs.json", changed)
+                panel.refresh_document()
+                self.assertEqual(design.call_args.args, ("ANOTHER_START",))
+                self.assertGreater(panel.revision, revision)
+                panel.queue()
+            lattice = MagneticLattice((Drift(l=2, eid="D"),))
+            preview = LatticePreview(
+                initial, [lattice], [twiss(lattice, initial)], np.array([[0.5, 1.5]])
+            )
+            initial_callbacks = len(
+                panel.canvas.callbacks.callbacks.get("motion_notify_event", {})
+            )
+            for coordinates in ("Original", "Normalized", "Original"):
+                panel.coordinates.set(coordinates)
+                panel.display(panel.revision, preview)
+                panel.canvas.draw()
+                self.assertEqual(len(panel.figure.axes), 5)
+                self.assertEqual(
+                    len(panel.canvas.callbacks.callbacks["motion_notify_event"]),
+                    initial_callbacks + 3,
+                )
+            (self.path / "lattice_configs.json").write_text("incomplete")
+            panel.refresh_document()
+            self.assertIsNone(panel.preview)
+            self.assertIsNone(panel.pending)
+            self.assertFalse(panel.figure.axes)
+            panel.close()
 
         def test_controller_settings_discard_old_refresh(self) -> None:
             """Changing applied settings keeps an older completed scan from repopulating the GUI."""

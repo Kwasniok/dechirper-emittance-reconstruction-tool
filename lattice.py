@@ -1,3 +1,5 @@
+"""Build T3 optics and visualize design or user-supplied initial Twiss states."""
+
 # %%
 from typing import Any
 from dataclasses import dataclass, fields, asdict
@@ -7,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import scipy.constants
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure, SubFigure
+from matplotlib.backend_bases import MouseEvent
 from tqdm import tqdm
 from ocelot import (
     m_e_GeV,
@@ -67,7 +71,7 @@ class LatticeHighLevelParams:
     global_max_beta: float = 300
     final_beta_min: float | None = 10.0
     r_34: float | None = None
-    minimize_second_order_t116  : bool = False
+    minimize_second_order_t116: bool = False
     dechirper_enabled: bool = False
     dechirper_dist_y: float = 500e-6  # distance from the plate in [m]
     dechirper_sigma_z: float = (
@@ -530,7 +534,7 @@ def make_lattice_and_navigator(
         assert (
             params.dechirper_sigma_z is not None
         ), "dechirper_sigma_z must be set if dechirper_enabled is True"
-        
+
         wk_tv_kick = WakeTableDechirperOffAxis(
             b=params.dechirper_dist_y,  # distance from the plate in [m]
             a=0.01,  # half gap between plates in [m]
@@ -560,7 +564,10 @@ def make_lattice_and_navigator(
 
 
 if __name__ == "__main__":
-    from beam import BeamParameters, make_beam_with_random_gaussian_mixture_current_profile
+    from beam import (
+        BeamParameters,
+        make_beam_with_random_gaussian_mixture_current_profile,
+    )
 
     lattice, navigator = make_lattice_and_navigator(
         LatticeHighLevelParams(
@@ -583,19 +590,89 @@ if __name__ == "__main__":
         beta_y=twiss0.beta_y,
     )
 
-    parts0 = make_beam_with_random_gaussian_mixture_current_profile(bea_params0, num_particles=20_000)
+    parts0 = make_beam_with_random_gaussian_mixture_current_profile(
+        bea_params0, num_particles=20_000
+    )
 
     twisses, partss = track(lattice, parts0, navigator)
 
 
 # %%
-def show_lattice(lattice: MagneticLattice):
+def show_lattice(
+    lattice: MagneticLattice,
+    twiss0: Twiss | None = None,
+    *,
+    figure: Figure | SubFigure | None = None,
+    twisses: list[Twiss] | None = None,
+    show: bool = True,
+    diagnostics: bool = True,
+) -> Figure | SubFigure:
+    """Show optics, or draw into an embedded figure without opening a window.
 
-    twiss0 = make_twiss0(start=lattice.sequence[0].id)
+    An explicit initial state overrides the design optics at the actual lattice
+    entrance. Embedded callers can reuse a propagated profile and suppress the
+    interactive window and printed transfer-map diagnostics.
+    """
+    twiss0 = twiss0 if twiss0 is not None else make_twiss0(lattice.sequence[0].id)
+    twisses = twisses if twisses is not None else twiss(lattice, twiss0)
+    if figure is None:
+        figure = plt.figure()
+    # Ocelot's plot_opt_func uses pyplot's current axes even with plt_figure.
+    # Use its axes-based helpers so embedded figures need no pyplot window.
+    top = figure.add_axes((0.12, 0.66, 0.84, 0.25))
+    betas = figure.add_axes((0.12, 0.23, 0.84, 0.43), sharex=top)
+    elements = figure.add_axes((0.12, 0.12, 0.84, 0.11), sharex=top)
+    positions = [state.s for state in twisses]
+    og.plot_disp(top, twisses, ["Dx", "Dxp"], 10)
+    og.plot_betas(
+        betas,
+        positions,
+        [state.beta_x for state in twisses],
+        [state.beta_y for state in twisses],
+        10,
+    )
+    previous_callbacks = set(
+        figure.canvas.callbacks.callbacks.get("motion_notify_event", {})
+    )
+    og.plot_elems(
+        figure,
+        elements,
+        lattice,
+        s_point=positions[0],
+        legend=False,
+        y_scale=0.8,
+        font_size=10,
+    )
+    # Ocelot's hover handler also uses pyplot. Redraw the owning canvas instead.
+    new_callbacks = (
+        set(figure.canvas.callbacks.callbacks.get("motion_notify_event", {}))
+        - previous_callbacks
+    )
+    for callback in new_callbacks:
+        figure.canvas.mpl_disconnect(callback)
 
-    twisses = twiss(lattice, twiss0)
-    og.plot_opt_func(lattice, twisses, legend=False, top_plot=["Dx", "Dxp"])
-    plt.show()
+    def hover(event: MouseEvent) -> None:
+        """Show element names on the embedded canvas without activating pyplot."""
+        changed = False
+        for patch, annotation in zip(elements.patches, elements.texts):
+            visible = event.inaxes is elements and patch.contains(event)[0]
+            if visible != annotation.get_visible():
+                annotation.set_visible(visible)
+                changed = True
+        if changed:
+            figure.canvas.draw_idle()
+
+    figure.canvas.mpl_connect("motion_notify_event", hover)
+    for axis in (top, betas, elements):
+        axis.grid(True, alpha=0.25)
+        axis.set_xlim(positions[0], positions[-1])
+    top.tick_params(labelbottom=False)
+    betas.tick_params(labelbottom=False)
+    elements.set_yticks([])
+    if show:
+        plt.show()
+    if not diagnostics:
+        return figure
 
     lat_vec, lat_matrix = lattice.transfer_maps(energy=twiss0.E)[:2]
 
@@ -611,6 +688,7 @@ def show_lattice(lattice: MagneticLattice):
     print(
         f"phase advance y: {abs_phase_advance_from_lattice(lattice, twiss0.E, Plane.Y)}"
     )
+    return figure
 
 
 if __name__ == "__main__":
