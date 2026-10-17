@@ -3,8 +3,6 @@
 
 Disclaimer: This code is created with AI support.
 
-Requires Python 3.13 or newer.
-
 The Lattice Preview tab compares configuration phase advances on the initial
 Twiss ellipses, using design optics at the configured lattice entrance by default.
 

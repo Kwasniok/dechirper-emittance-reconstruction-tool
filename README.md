@@ -1,5 +1,5 @@
 ## requirements
-- python v3.13+
+- python v3.12+
 
 ## install
 ```bash
