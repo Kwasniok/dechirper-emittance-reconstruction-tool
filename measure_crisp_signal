@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+
+import argparse
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from uuid import uuid4 as uuid
+import pydoocs
+
+parser = argparse.ArgumentParser(description="Measure emittance at EuXFEL T3")
+parser.add_argument(
+    "--experiment_name",
+    "-e",
+    type=str,
+    required=True,
+    help="Name of the experiment (used for data storage)",
+)
+parser.add_argument(
+    "--data_path",
+    "-d",
+    type=str,
+    default="data",
+    help="Path to store the measurement data",
+)
+args = parser.parse_args()
+
+
+def measure(experiment_name: str) -> dict[str, float]:
+    sample_id = (
+        "CRISP_"
+        # time stamp incl milliseconds
+        + datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
+        + "-"
+        + uuid().hex[:8]
+    )
+
+    crisp = pydoocs.read(
+        "XFEL.SDIAG/THZ_SPECTROMETER.FORMFACTOR/CRD.1934.TL/FORMFACTOR_MEAN_NTH.XY"
+    )
+    crisp_int = pydoocs.read(
+        "XFEL.SDIAG/THZ_SPECTROMETER.FORMFACTOR/CRD.1934.TL/INTENSITY.TD"
+    )
+    crisp_status = pydoocs.read(
+        "XFEL.SDIAG/THZ_SPECTROMETER.GRATINGMOVER/CRD.1934.TL/GRATING"
+    )
+    crisp_lim = pydoocs.read(
+        "XFEL.SDIAG/THZ_SPECTROMETER.FORMFACTOR/CRD.1934.TL/FORMFACTOR_MEAN_DETECTLIMIT.XY"
+    )
+
+    path_raw = Path(args.data_path, experiment_name, "data_raw", f"{sample_id}.npz")
+    path_raw.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "crisp": crisp,
+        "crisp_int": crisp_int,
+        "crisp_status": crisp_status,
+        "crisp_lim": crisp_lim,
+    }
+
+    np.savez(path_raw, **data)
+
+    return data
+
+
+# main
+if __name__ == "__main__":
+    data = measure(args.experiment_name)
