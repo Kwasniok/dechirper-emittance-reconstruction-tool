@@ -19,13 +19,13 @@ source .venv/bin/activate
 ### measurement
 For your `<EXPERIMENT_NAME>` manually go through each `<LATTICE_CONFIG_INDEX>` values and run the setup command followed by the measurement command:
 ```bash
-./setup --experiment_name <EXPERIMENT_NAME> --lattice_config_index <LATTICE_CONFIG_INDEX>
-./measure --experiment_name <EXPERIMENT_NAME> --lattice_config_index <LATTICE_CONFIG_INDEX>
+python setup.py --experiment_name <EXPERIMENT_NAME> --lattice_config_index <LATTICE_CONFIG_INDEX>
+python measure.py --experiment_name <EXPERIMENT_NAME> --lattice_config_index <LATTICE_CONFIG_INDEX>
 ```
 
 ### data analysis
 ```bash
-python tool gui data/<EXPERIMENT_NAME>
+python tool.py gui data/<EXPERIMENT_NAME>
 ```
 
 The **Lattice Preview** tab shows the selected target configuration's optics and

@@ -6489,7 +6489,7 @@ def main() -> None:
                         help="Parent for timestamped processed folder (default: input experiment directory)",
                     )
                     subparser.add_argument(
-                        "--no-raw-copy",
+                        "--no_raw_copy",
                         action="store_true",
                         help="Export source hashes without copying raw inputs",
                     )

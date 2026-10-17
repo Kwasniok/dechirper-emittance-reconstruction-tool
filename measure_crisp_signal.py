@@ -7,25 +7,8 @@ from datetime import datetime
 from uuid import uuid4 as uuid
 import pydoocs
 
-parser = argparse.ArgumentParser(description="Measure emittance at EuXFEL T3")
-parser.add_argument(
-    "--experiment_name",
-    "-e",
-    type=str,
-    required=True,
-    help="Name of the experiment (used for data storage)",
-)
-parser.add_argument(
-    "--data_path",
-    "-d",
-    type=str,
-    default="data",
-    help="Path to store the measurement data",
-)
-args = parser.parse_args()
 
-
-def measure(experiment_name: str) -> dict[str, float]:
+def measure(data_path: str, experiment_name: str) -> dict[str, float]:
     sample_id = (
         "CRISP_"
         # time stamp incl milliseconds
@@ -47,7 +30,7 @@ def measure(experiment_name: str) -> dict[str, float]:
         "XFEL.SDIAG/THZ_SPECTROMETER.FORMFACTOR/CRD.1934.TL/FORMFACTOR_MEAN_DETECTLIMIT.XY"
     )
 
-    path_raw = Path(args.data_path, experiment_name, "data_raw", f"{sample_id}.npz")
+    path_raw = Path(data_path, experiment_name, "data_raw", f"{sample_id}.npz")
     path_raw.parent.mkdir(parents=True, exist_ok=True)
 
     data = {
@@ -62,6 +45,26 @@ def measure(experiment_name: str) -> dict[str, float]:
     return data
 
 
-# main
+def main():
+    parser = argparse.ArgumentParser(description="Measure emittance at EuXFEL T3")
+    parser.add_argument(
+        "--experiment_name",
+        "-e",
+        type=str,
+        required=True,
+        help="Name of the experiment (used for data storage)",
+    )
+    parser.add_argument(
+        "--data_path",
+        "-d",
+        type=str,
+        default="data",
+        help="Path to store the measurement data",
+    )
+    args = parser.parse_args()
+
+    data = measure(args.data_path, args.experiment_name)
+
+
 if __name__ == "__main__":
-    data = measure(args.experiment_name)
+    main()
